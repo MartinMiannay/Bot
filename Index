@@ -1,0 +1,147 @@
+require("dotenv").config();
+const TelegramBot = require("node-telegram-bot-api");
+const cron = require("node-cron");
+const http = require("http");
+
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+
+if (!BOT_TOKEN || !CHAT_ID || !ANTHROPIC_KEY) {
+  console.error("❌ Missing env vars. Check your .env file.");
+  process.exit(1);
+}
+
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+let history = [];
+
+const SYSTEM_PROMPT = `You are a sharp, efficient personal assistant on Telegram.
+You have access to web search via a tool. You help with:
+1. News: search and summarize current events
+2. Reminders/alarms: when user asks for a reminder, end your response with:
+   ALARM_REQUEST:{"hour":14,"minute":30,"message":"Reminder text"}
+3. General planning, tasks, advice, questions
+
+Tone: Concise, direct, smart. Format for Telegram using *bold* and bullet points.`;
+
+async function askClaude(userText) {
+  const now = new Date();
+  const systemWithTime = `${SYSTEM_PROMPT}\n\nCurrent date/time: ${now.toLocaleString("fr-FR", {
+    weekday: "long", year: "numeric", month: "long",
+    day: "numeric", hour: "2-digit", minute: "2-digit",
+  })}`;
+
+  history.push({ role: "user", content: userText });
+  if (history.length > 20) history = history.slice(-20);
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": ANTHROPIC_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1000,
+      system: systemWithTime,
+      messages: history,
+      tools: [{ type: "web_search_20250305", name: "web_search" }],
+    }),
+  });
+
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error?.message || "API error");
+
+  const text = data.content
+    ?.filter(b => b.type === "text")
+    ?.map(b => b.text)
+    ?.join("\n") || "No response.";
+
+  history.push({ role: "assistant", content: text });
+  return text;
+}
+
+function parseAlarm(text) {
+  const match = text.match(/ALARM_REQUEST:(\{[^\n]+\})/);
+  if (match) { try { return JSON.parse(match[1]); } catch {} }
+  return null;
+}
+
+function cleanText(text) {
+  return text.replace(/ALARM_REQUEST:\{[^\n]+\}/g, "").trim();
+}
+
+function scheduleAlarm(alarm) {
+  const now = new Date();
+  const target = new Date();
+  target.setHours(alarm.hour, alarm.minute, 0, 0);
+  if (target <= now) target.setDate(target.getDate() + 1);
+  const delay = target - now;
+  setTimeout(() => {
+    bot.sendMessage(CHAT_ID, `⏰ *Reminder:* ${alarm.message}`, { parse_mode: "Markdown" });
+  }, delay);
+}
+
+async function sendProactive(prompt) {
+  try {
+    bot.sendChatAction(CHAT_ID, "typing");
+    const reply = await askClaude(prompt);
+    await bot.sendMessage(CHAT_ID, cleanText(reply), { parse_mode: "Markdown" });
+  } catch (err) {
+    console.error("Proactive error:", err.message);
+  }
+}
+
+bot.onText(/\/start/, () => {
+  bot.sendMessage(CHAT_ID,
+    `✦ *Assistant ready*\n\n• /day — today's plan\n• /news — news brief\n• /clear — clear memory\n\nOr just talk to me naturally.`,
+    { parse_mode: "Markdown" }
+  );
+});
+
+bot.onText(/\/day/, async () => {
+  bot.sendChatAction(CHAT_ID, "typing");
+  const reply = await askClaude("Give me a structured overview of my day and what I should focus on.");
+  bot.sendMessage(CHAT_ID, cleanText(reply), { parse_mode: "Markdown" });
+});
+
+bot.onText(/\/news/, async () => {
+  bot.sendChatAction(CHAT_ID, "typing");
+  const reply = await askClaude("Give me a 5-bullet news recap of the most important things happening today.");
+  bot.sendMessage(CHAT_ID, cleanText(reply), { parse_mode: "Markdown" });
+});
+
+bot.onText(/\/clear/, () => {
+  history = [];
+  bot.sendMessage(CHAT_ID, "🧹 Memory cleared.");
+});
+
+bot.on("message", async (msg) => {
+  if (!msg.text || msg.text.startsWith("/")) return;
+  if (String(msg.chat.id) !== String(CHAT_ID)) return;
+  try {
+    bot.sendChatAction(CHAT_ID, "typing");
+    const reply = await askClaude(msg.text);
+    const alarm = parseAlarm(reply);
+    if (alarm) scheduleAlarm(alarm);
+    await bot.sendMessage(CHAT_ID, cleanText(reply), { parse_mode: "Markdown" });
+  } catch (err) {
+    bot.sendMessage(CHAT_ID, `⚠️ Error: ${err.message}`);
+  }
+});
+
+// Morning briefing 8am
+cron.schedule("0 8 * * *", () => {
+  sendProactive("Good morning! Give me top 3 news headlines and a productivity tip for the day.");
+});
+
+// Evening recap 6pm
+cron.schedule("0 18 * * *", () => {
+  sendProactive("Evening recap: give me 2 things to prepare for tomorrow.");
+});
+
+http.createServer((_, res) => res.end("ok")).listen(process.env.PORT || 3000);
+
+console.log("✦ Bot is running...");
+bot.sendMessage(CHAT_ID, "✦ *Assistant is online and ready.*", { parse_mode: "Markdown" }).catch(() => {});
